@@ -8,16 +8,9 @@ from datasets import Dataset
 
 # bitsandbytes + Transformers
 import bitsandbytes as bnb
-from transformers import (
-    AutoTokenizer, 
-    AutoModelForCausalLM, 
-    BitsAndBytesConfig
-)
+from transformers import AutoTokenizer, AutoModelForCausalLM,  BitsAndBytesConfig
 
-# PEFT (LoRA)
 from peft import LoraConfig, get_peft_model, TaskType
-
-# UnSloth for high-level training interface
 from unsloth.trainer import UnslothTrainer, UnslothTrainingArguments
 
 
@@ -58,9 +51,7 @@ def preprocess_function(examples: Dict[str, str], tokenizer, max_length: int = 5
 
 
 def main():
-    # =========================================================================
     # 1. Configurations (paths, model IDs, etc.)
-    # =========================================================================
 
     # Path to your JSONL dataset
     train_jsonl = "datasets/theo-train.jsonl"
@@ -96,21 +87,15 @@ def main():
             remove_columns=eval_dataset.column_names
         )
 
-    # =========================================================================
-    # 2. BitsAndBytes quantization config
-    #    (4-bit; change to load_in_8bit=True if you prefer 8-bit)
-    # =========================================================================
+    # BitsAndBytes quantization config
     quant_config = BitsAndBytesConfig(
         load_in_4bit=True,                     # switch to load_in_8bit=True for 8-bit
         bnb_4bit_compute_dtype=torch.bfloat16, # keep bf16 for compute
         bnb_4bit_use_double_quant=True,        
-        bnb_4bit_quant_type="nf4"              # can be "nf4" or "fp4"
+        bnb_4bit_quant_type="fp4"
     )
 
-    # =========================================================================
-    # 3. Define the Optuna objective
-    # =========================================================================
-
+    # Define the Optuna objective
     def objective(trial: optuna.trial.Trial):
         """
         Optuna objective function that:
@@ -120,9 +105,7 @@ def main():
           4. Returns the eval_loss for the trial.
         """
 
-        # ----------------------
         # Hyperparameter search
-        # ----------------------
         num_train_epochs = trial.suggest_int("num_train_epochs", 3, 12)
         learning_rate = trial.suggest_float("learning_rate", 1e-6, 1e-4, log=True)
         per_device_train_batch_size = trial.suggest_int("per_device_train_batch_size", 2, 4)
@@ -146,10 +129,9 @@ def main():
             bf16=True,     # Use bf16 for forward pass
         )
 
-        # ----------------------
         # Model Initialization
-        # ----------------------
-        # 1) Load base model in 4-bit (or 8-bit)
+
+        # Load base model in 4-bit (or 8-bit)
         base_model = AutoModelForCausalLM.from_pretrained(
             model_id,
             trust_remote_code=True,
@@ -157,8 +139,7 @@ def main():
             quantization_config=quant_config
         )
 
-        # 2) Setup LoRA config
-        #    We'll fine-tune only the LoRA layers, the rest remains in 4/8-bit
+        # Setup LoRA config
         lora_config = LoraConfig(
             r=lora_r,
             lora_alpha=lora_alpha,
@@ -168,12 +149,10 @@ def main():
             target_modules=["q_proj", "v_proj"]  # typical for LLMs
         )
 
-        # 3) Attach LoRA adapters
+        # Attach LoRA adapters
         model = get_peft_model(base_model, lora_config)
 
-        # ----------------------
         # Trainer setup
-        # ----------------------
         trainer = UnslothTrainer(
             model=model,
             args=training_args,
@@ -181,14 +160,10 @@ def main():
             eval_dataset=eval_dataset if eval_dataset else None,
         )
 
-        # ----------------------
         # Training
-        # ----------------------
         trainer.train()
 
-        # ----------------------
         # Evaluation
-        # ----------------------
         if eval_dataset:
             eval_results = trainer.evaluate()
             eval_loss = eval_results["eval_loss"]
@@ -200,9 +175,7 @@ def main():
             print(f"Trial {trial.number} finished with train_loss={train_loss:.4f} (no eval set)")
             return train_loss
 
-    # =========================================================================
-    # 4. Run the Optuna Study
-    # =========================================================================
+    # Run the Optuna Study
     study = optuna.create_study(direction="minimize")
     study.optimize(objective, n_trials=3)
 
@@ -211,9 +184,7 @@ def main():
     print(f"Best Trial Params: {study.best_trial.params}")
     print(f"Best Trial Value (eval_loss): {study.best_value}")
 
-    # =========================================================================
-    # 5. (Optional) Final training with the best hyperparameters
-    # =========================================================================
+    # Final training with the best hyperparameters
 
     best_params = study.best_trial.params
 
