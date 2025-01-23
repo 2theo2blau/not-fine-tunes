@@ -58,10 +58,10 @@ def main():
     eval_jsonl = "datasets/theo-eval.jsonl"  # optional
 
     # Choose the Mistral model
-    model_id = "mistralai/Mistral-7B-v0.3"
+    model_id = "mistralai/Mistral-7B-Instruct-v0.3"
 
     # Output directory for your fine-tuned model
-    output_dir = "./mistral-finetuned"
+    output_dir = "./mistral-inst-finetuned"
 
     # Load tokenizer
     tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=True)
@@ -98,40 +98,44 @@ def main():
     # Define the Optuna objective
     def objective(trial: optuna.trial.Trial):
         """
-        Optuna objective function that:
-          1. Samples hyperparameters from trial.
-          2. Initializes model + LoRA adapters.
-          3. Trains the model.
-          4. Returns the eval_loss for the trial.
+        Optuna objective function that runs faster trials by:
+          1. Using a subset of training data
+          2. Running fewer epochs
+          3. Using smaller hyperparameter ranges
+        Full training only happens after finding best hyperparameters.
         """
+        # Create a smaller subset of training data for faster trials
+        trial_train_dataset = train_dataset.shuffle(seed=42).select(range(min(len(train_dataset), 200)))
+        trial_eval_dataset = eval_dataset.shuffle(seed=42).select(range(min(len(eval_dataset), 40))) if eval_dataset else None
 
-        # Hyperparameter search
-        num_train_epochs = trial.suggest_int("num_train_epochs", 3, 12)
+        # Hyperparameter search with smaller ranges
+        num_train_epochs = trial.suggest_int("num_train_epochs", 3, 6)  # Reduced from 3-6
         learning_rate = trial.suggest_float("learning_rate", 1e-6, 1e-4, log=True)
         per_device_train_batch_size = trial.suggest_int("per_device_train_batch_size", 2, 4)
         gradient_accumulation_steps = trial.suggest_int("gradient_accumulation_steps", 1, 3)
 
-        # LoRA hyperparams for demonstration
+        # LoRA hyperparams with slightly reduced ranges
         lora_r = trial.suggest_int("lora_r", 4, 16)
         lora_alpha = trial.suggest_int("lora_alpha", 16, 64, step=16)
-        lora_dropout = trial.suggest_float("lora_dropout", 0.0, 0.1, step=0.01)
+        lora_dropout = trial.suggest_float("lora_dropout", 0.02, 0.1, step=0.01)
 
         training_args = UnslothTrainingArguments(
-            output_dir=output_dir,
+            output_dir=os.path.join(output_dir, f"trial_{trial.number}"),
             num_train_epochs=num_train_epochs,
             per_device_train_batch_size=per_device_train_batch_size,
             per_device_eval_batch_size=2,
             gradient_accumulation_steps=gradient_accumulation_steps,
-            evaluation_strategy="epoch",  # Evaluate at the end of each epoch
-            logging_steps=50,
+            evaluation_strategy="epoch",
+            logging_steps=10,  # Reduced from 50
             learning_rate=learning_rate,
-            fp16=False,    # Turn off fp16
-            bf16=True,     # Use bf16 for forward pass
+            fp16=False,
+            bf16=True,
+            load_best_model_at_end=True,
+            metric_for_best_model="eval_loss",
+            greater_is_better=False,
         )
 
         # Model Initialization
-
-        # Load base model in 4-bit (or 8-bit)
         base_model = AutoModelForCausalLM.from_pretrained(
             model_id,
             trust_remote_code=True,
@@ -139,45 +143,42 @@ def main():
             quantization_config=quant_config
         )
 
-        # Setup LoRA config
         lora_config = LoraConfig(
             r=lora_r,
             lora_alpha=lora_alpha,
             lora_dropout=lora_dropout,
             bias="none",
             task_type=TaskType.CAUSAL_LM,
-            target_modules=["q_proj", "v_proj"]  # typical for LLMs
+            target_modules=["q_proj", "v_proj"]
         )
 
-        # Attach LoRA adapters
         model = get_peft_model(base_model, lora_config)
 
-        # Trainer setup
         trainer = UnslothTrainer(
             model=model,
             args=training_args,
-            train_dataset=train_dataset,
-            eval_dataset=eval_dataset if eval_dataset else None,
+            train_dataset=trial_train_dataset,
+            eval_dataset=trial_eval_dataset if trial_eval_dataset else None,
         )
 
         # Training
         trainer.train()
 
         # Evaluation
-        if eval_dataset:
+        if trial_eval_dataset:
             eval_results = trainer.evaluate()
             eval_loss = eval_results["eval_loss"]
             print(f"Trial {trial.number} finished with eval_loss={eval_loss:.4f}")
             return eval_loss
         else:
-            train_results = trainer.evaluate(train_dataset)
+            train_results = trainer.evaluate(trial_train_dataset)
             train_loss = train_results["eval_loss"]
             print(f"Trial {trial.number} finished with train_loss={train_loss:.4f} (no eval set)")
             return train_loss
 
     # Run the Optuna Study
     study = optuna.create_study(direction="minimize")
-    study.optimize(objective, n_trials=3)
+    study.optimize(objective, n_trials=10)
 
     print("\n===== Hyperparameter Search Complete! =====")
     print(f"Best Trial ID: {study.best_trial.number}")
