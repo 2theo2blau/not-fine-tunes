@@ -1,12 +1,9 @@
 import os
 import json
 from typing import Dict
-
 import torch
 import optuna
 from datasets import Dataset
-
-# bitsandbytes + Transformers
 import bitsandbytes as bnb
 from transformers import AutoTokenizer, AutoModelForCausalLM,  BitsAndBytesConfig
 
@@ -14,12 +11,8 @@ from peft import LoraConfig, get_peft_model, TaskType
 from unsloth.trainer import UnslothTrainer, UnslothTrainingArguments
 
 
+# Load JSONL dataset
 def load_jsonl_dataset(jsonl_path: str) -> Dataset:
-    """
-    Loads a JSONL file and returns a HuggingFace Dataset object.
-    Each line in the JSONL should be a valid JSON object:
-        {"instruction": "...", "response": "..."}
-    """
     data_list = []
     with open(jsonl_path, 'r', encoding='utf-8') as f:
         for line in f:
@@ -28,15 +21,10 @@ def load_jsonl_dataset(jsonl_path: str) -> Dataset:
                 data_list.append(json.loads(line))
     return Dataset.from_list(data_list)
 
-
+# Tokenize instruction/response pairs
 def preprocess_function(examples: Dict[str, str], tokenizer, max_length: int = 512):
-    """
-    Tokenize the instruction/response pairs.
-    Adjust according to your data structure.
-    """
     texts = []
     for instruction, response in zip(examples["instruction"], examples["response"]):
-        # Customize how you combine instruction & response:
         text = f"Instruction: {instruction}\n\nResponse: {response}"
         texts.append(text)
 
@@ -51,17 +39,16 @@ def preprocess_function(examples: Dict[str, str], tokenizer, max_length: int = 5
 
 
 def main():
-    # 1. Configurations (paths, model IDs, etc.)
 
-    # Path to your JSONL dataset
+    # Path to JSONL dataset
     train_jsonl = "datasets/theo-train.jsonl"
     eval_jsonl = "datasets/theo-eval.jsonl"  # optional
 
-    # Choose the Mistral model
-    model_id = "mistralai/Mistral-7B-Instruct-v0.3"
+    # Specify model
+    model_id = "mistralai/Mistral-Nemo-Instruct-2407"
 
-    # Output directory for your fine-tuned model
-    output_dir = "./mistral-inst-finetuned"
+    # Output directory
+    output_dir = "./mistral-nemo-finetuned-0125"
 
     # Load tokenizer
     tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=True)
@@ -87,34 +74,27 @@ def main():
             remove_columns=eval_dataset.column_names
         )
 
-    # BitsAndBytes quantization config
+    # BitsAndBytes config
     quant_config = BitsAndBytesConfig(
-        load_in_4bit=True,                     # switch to load_in_8bit=True for 8-bit
-        bnb_4bit_compute_dtype=torch.bfloat16, # keep bf16 for compute
+        load_in_4bit=True,
+        bnb_4bit_compute_dtype=torch.bfloat16,
         bnb_4bit_use_double_quant=True,        
         bnb_4bit_quant_type="fp4"
     )
 
     # Define the Optuna objective
     def objective(trial: optuna.trial.Trial):
-        """
-        Optuna objective function that runs faster trials by:
-          1. Using a subset of training data
-          2. Running fewer epochs
-          3. Using smaller hyperparameter ranges
-        Full training only happens after finding best hyperparameters.
-        """
-        # Create a smaller subset of training data for faster trials
-        trial_train_dataset = train_dataset.shuffle(seed=42).select(range(min(len(train_dataset), 200)))
-        trial_eval_dataset = eval_dataset.shuffle(seed=42).select(range(min(len(eval_dataset), 40))) if eval_dataset else None
+        # Create a subset of training data for faster trials
+        trial_train_dataset = train_dataset.shuffle(seed=42).select(range(min(len(train_dataset), 400)))
+        trial_eval_dataset = eval_dataset.shuffle(seed=42).select(range(min(len(eval_dataset), 80))) if eval_dataset else None
 
-        # Hyperparameter search with smaller ranges
+        # Hyperparameter search
         num_train_epochs = trial.suggest_int("num_train_epochs", 3, 6)  # Reduced from 3-6
         learning_rate = trial.suggest_float("learning_rate", 1e-6, 1e-4, log=True)
         per_device_train_batch_size = trial.suggest_int("per_device_train_batch_size", 2, 4)
         gradient_accumulation_steps = trial.suggest_int("gradient_accumulation_steps", 1, 3)
 
-        # LoRA hyperparams with slightly reduced ranges
+        # LoRA hyperparams
         lora_r = trial.suggest_int("lora_r", 4, 16)
         lora_alpha = trial.suggest_int("lora_alpha", 16, 64, step=16)
         lora_dropout = trial.suggest_float("lora_dropout", 0.02, 0.1, step=0.01)
@@ -130,9 +110,6 @@ def main():
             learning_rate=learning_rate,
             fp16=False,
             bf16=True,
-            load_best_model_at_end=True,
-            metric_for_best_model="eval_loss",
-            greater_is_better=False,
         )
 
         # Model Initialization
@@ -213,7 +190,7 @@ def main():
         logging_steps=50,
     )
 
-    # Re-initialize the base model in quantized form
+    # Re-initialize base model
     base_model = AutoModelForCausalLM.from_pretrained(
         model_id,
         trust_remote_code=True,
@@ -221,7 +198,7 @@ def main():
         quantization_config=quant_config
     )
 
-    # Create the same LoRA config
+    # Create final LoRA config
     final_lora_config = LoraConfig(
         r=final_lora_r,
         lora_alpha=final_lora_alpha,
@@ -232,7 +209,7 @@ def main():
     )
     best_model = get_peft_model(base_model, final_lora_config)
 
-    # Final trainer
+    # Final trainer with best hyperparameters
     final_trainer = UnslothTrainer(
         model=best_model,
         args=final_training_args,
@@ -240,7 +217,6 @@ def main():
         eval_dataset=eval_dataset,
     )
 
-    # Train with best hyperparameters
     final_trainer.train()
 
     # Evaluate & save
@@ -248,9 +224,7 @@ def main():
         final_eval = final_trainer.evaluate()
         print("Final eval_loss after best hyperparam training:", final_eval["eval_loss"])
 
-    # Saving LoRA-adapted model:
-    # By default, `save_model` with a PEFT model
-    # will store only the adapter weights (plus a config) in output_dir/adapter_model.bin
+    # Save LoRA model
     final_trainer.save_model(final_training_args.output_dir)
     tokenizer.save_pretrained(final_training_args.output_dir)
 
